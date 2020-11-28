@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2019, The Linux Foundation. All rights reserved.
  * Not a Contribution.
  *
  * Copyright 2015 The Android Open Source Project
@@ -371,6 +371,8 @@ int HWCDisplay::Init() {
 
   client_target_ = new HWCLayer(id_, buffer_allocator_);
 
+  fbt_valid_ = false;
+
   int blit_enabled = 0;
   HWCDebugHandler::Get()->GetProperty("persist.hwc.blit.comp", &blit_enabled);
   if (needs_blit_ && blit_enabled) {
@@ -605,6 +607,7 @@ void HWCDisplay::BuildLayerStack() {
   }
 #endif
 
+  layer_stack_.flags.fbt_valid = fbt_valid_;
   // TODO(user): Set correctly when SDM supports geometry_changes as bitmask
   layer_stack_.flags.geometry_changed = UINT32(geometry_changes_ > 0);
   // Append client target to the layer stack
@@ -853,7 +856,7 @@ HWC2::Error HWCDisplay::GetDisplayName(uint32_t *out_size, char *out_name) {
         name = "Unknown";
         break;
     }
-    std::strncpy(out_name, name.c_str(), name.size());
+    strlcpy(out_name, name.c_str(), name.size());
     *out_size = UINT32(name.size());
   }
   return HWC2::Error::None;
@@ -910,7 +913,7 @@ HWC2::Error HWCDisplay::SetClientTarget(buffer_handle_t target, int32_t acquire_
     // Data space would be validated at GetClientTargetSupport, so just use here.
     sdm::GetSDMColorSpace(dataspace, &sdm_layer->input_buffer.color_metadata);
   }
-
+  fbt_valid_ = true;
   return HWC2::Error::None;
 }
 
@@ -1225,8 +1228,10 @@ HWC2::Error HWCDisplay::PostCommitLayerStack(int32_t *out_retire_fence) {
 
   // Do no call flush on errors, if a successful buffer is never submitted.
   if (flush_ && flush_on_error_) {
-    display_intf_->Flush();
-    validated_.reset();
+    display_intf_->Flush(secure_display_transition_);
+    secure_display_transition_ = false;
+    validated_.reset(type_);
+    flush_on_error_ = false;
   }
 
   if (tone_mapper_ && tone_mapper_->IsActive()) {
@@ -1477,10 +1482,9 @@ void HWCDisplay::DumpInputBuffers() {
     auto acquire_fence_fd = layer->input_buffer.acquire_fence_fd;
 
     if (acquire_fence_fd >= 0) {
-      int error = sync_wait(acquire_fence_fd, 1000);
-      if (error < 0) {
-        DLOGW("sync_wait error errno = %d, desc = %s", errno, strerror(errno));
-        return;
+      DisplayError error = buffer_allocator_->MapBuffer(pvt_handle, acquire_fence_fd);
+      if (error != kErrorNone) {
+        continue;
       }
     }
 
@@ -1677,6 +1681,7 @@ int HWCDisplay::SetDisplayStatus(DisplayStatus display_status) {
   switch (display_status) {
     case kDisplayStatusResume:
       display_paused_ = false;
+      fbt_valid_ = false;
     case kDisplayStatusOnline:
       status = INT32(SetPowerMode(HWC2::PowerMode::On));
       break;
@@ -1701,6 +1706,11 @@ int HWCDisplay::SetDisplayStatus(DisplayStatus display_status) {
 HWC2::Error HWCDisplay::SetCursorPosition(hwc2_layer_t layer, int x, int y) {
   if (shutdown_pending_) {
     return HWC2::Error::None;
+  }
+
+  if (!layer_stack_.flags.cursor_present) {
+    DLOGW("Cursor layer not present");
+    return HWC2::Error::BadLayer;
   }
 
   HWCLayer *hwc_layer = GetHWCLayer(layer);
@@ -1890,6 +1900,7 @@ void HWCDisplay::SetSecureDisplay(bool secure_display_active) {
     DLOGI("SecureDisplay state changed from %d to %d Needs Flush!!", secure_display_active_,
           secure_display_active);
     secure_display_active_ = secure_display_active;
+    secure_display_transition_ = true;
     skip_prepare_ = true;
   }
   return;
